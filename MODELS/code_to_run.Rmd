@@ -1,0 +1,215 @@
+---
+title: "Bayesian Meta-Analysis on Pairwise Plant Competition"
+author: "Marina Golivets"
+date: "`r Sys.Date()`"
+output: html_document
+---
+<br>
+**Load packages**
+```{r packages, warning = FALSE, message = FALSE}
+library(metafor)
+library(rstan)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+library(tidyr)
+library(dplyr)
+library(plyr)
+library(ape)
+library(reshape2)
+library(bayesplot)
+theme_set(theme_default())
+library(loo)
+```
+<br>
+**Import data**
+```{r data}
+ # additive design dataset
+dat <- read.csv(file = "MGolivets_plant_biomass_additive.csv", header = TRUE, stringsAsFactors = FALSE)
+
+ # replacement design dataset
+dat <- read.csv(file = "MGolivets_plant_biomass_replacement.csv", header = TRUE, stringsAsFactors = FALSE)
+```
+<br>
+**Calculate effect sizes (Hedges' d) and their variances**
+```{r effect sizes}
+# Hedges' d*
+dat <- escalc(n1i = trt.s.size, n2i = ctrl.s.size, m1i = trt.mean, m2i = ctrl.mean, 
+                sd1i = trt.sd, sd2i = ctrl.sd, data = dat, measure = "SMD")
+```
+<br>
+**Subset data**
+```{r data subset}
+# exclude studies with extreme values of effect sizes
+dat <- subset(dat, dat$yi > -20 & dat$yi < 20)
+
+# exclude studies where non-naturalized species were used
+dat <- subset(dat, dat$neighbor.local.invas.status != "not established")
+dat <- subset(dat, dat$target.local.invas.status != "not established") 
+
+# target ratio
+dat$target.ratio[is.na(dat$target.ratio)] <- .5
+
+dat <- subset(dat, trt.s.size > 2 & ctrl.s.size > 2)
+
+# dat <- subset(dat, neighbor.monocot != "none" & target.monocot != "none")
+```
+<br>
+**Subset pairs**
+```{r}
+# subset pairs
+dat <- arrange(dat, pb.id, pair)
+dat <- dat[!is.na(dat$pair), ]
+length(unique(dat$pair.id))
+names <- names(which(table(dat$pair.id) != 2))
+dat <- dat[-which(dat$pair.id %in% names), ]
+
+dat$group1 <- dat$group
+dat$group1[dat$group1 == "nntv-ntv"] <- "ntv-nntv"
+```
+**Calculate relative yield total**
+```{r}
+source(file = "function_RYT.R")
+dat <- dat.RYTtotal(dat = dat)[rep(1:2, nrow(dat)/2) == 1, ]
+dat$target.ratio <- round(dat$target.ratio - .5, 2)
+dat$target.ratio <- abs(dat$target.ratio)
+```
+<br>
+**Calculate phylogenetic correlation matrices**
+```{r}
+# upload phylogenetic tree
+tree <- read.tree("Zanne_et_al_2014_trimmed_tree.tre")
+
+source("trim_phylo_tree.R")
+
+trimmedData <- trimTree.fn(Tree = tree, Neighbor = TRUE, Target = TRUE)
+  
+dat <-  trimmedData$Data
+
+
+
+# neighbor species
+VCV.nb <- vcv.phylo(trimmedData$TreeNeighbor, corr = TRUE) 
+nb.sp.names <- colnames(VCV.nb)
+mm.nb <- rep(NA, length(nb.sp.names))
+for (i in 1:length(nb.sp.names)) mm.nb[which(dat$neighbor.name.phylo == nb.sp.names[i])] = i
+
+# target species
+VCV.tg <- vcv.phylo(trimmedData$TreeTarget, corr = TRUE)
+tg.sp.names <- colnames(VCV.tg)
+mm.tg <- rep(NA, length(tg.sp.names))
+for (i in 1:length(tg.sp.names)) mm.tg[which(dat$target.name.phylo == tg.sp.names[i])] = i
+
+# # trim the phylogenetic tree to obtain phylogenies for competitor and target species
+# 
+#  # neighbor species phylogeny
+# sp.exclude.nb <- tree$tip.label[-which(tree$tip.label %in% unique(dat$neighbor.name.phylo)[which(unique(dat$neighbor.name.phylo) %in% tree$tip.label)])]
+# tree.trim.nb <- drop.tip(tree, sp.exclude.nb, trim.internal = TRUE, subtree = FALSE,
+#          root.edge = 0, rooted = is.rooted(tree))
+# 
+#  # target species phylogeny
+# sp.exclude.tg <- tree$tip.label[-which(tree$tip.label %in% unique(dat$target.name.phylo)[which(unique(dat$target.name.phylo) %in% tree$tip.label)])]
+# tree.trim.tg <- drop.tip(tree, sp.exclude.tg, trim.internal = TRUE, subtree = FALSE,
+#          root.edge = 0, rooted = is.rooted(tree))
+# 
+# # subset data (based on species included in the two phylogenies)
+# dat.subs <- subset(dat, dat$neighbor.name.phylo %in% tree$tip.label)
+# dat.subs <- subset(dat.subs, dat.subs$target.name.phylo %in% tree$tip.label)
+# dat <- dat.subs
+# 
+# # subset measurements at a plant level
+# # dat <- subset(dat, measur.level == "plant")
+# 
+# 
+
+# 
+# # (trim the trees again)
+# 
+# # dat <- dat[dat$target.monocot != "none" & dat$neighbor.monocot != "none", ]
+# # 
+# # write.csv(dat, "dat.phylo2.ad.PairDif.csv")
+# 
+# 
+# calculate phylogenetic distance between target and neighbor
+phylo.dist <- cophenetic.phylo(tree)
+dat$pair.dist <- rep(NA, nrow(dat))
+for (i in 1:nrow(dat)){
+dat$pair.dist[i] <- phylo.dist[which(rownames(phylo.dist) == dat$neighbor.name.phylo[i]),
+           which(colnames(phylo.dist) == dat$target.name.phylo[i])]
+}
+
+
+# # scale phylogenetic distance if needed
+# dat$pair.dist <- as.numeric(scale(dat$pair.dist))
+
+# subset data
+dat <- subset(dat, group == "nntv-ntv")
+
+
+table(dat$neighbor.monocot); table(dat$target.monocot)
+dat[dat$neighbor.monocot == "none", ]$neighbor.monocot <- "n"
+dat[dat$target.monocot == "none", ]$target.monocot <- "n"
+
+
+dat$monocot1 <- interaction(dat$neighbor.monocot, dat$target.monocot)
+dat[dat$monocot1 == "y.n" | dat$monocot1 == "n.y", ]$monocot1 <- "y.y"
+dat$monocot1 <- droplevels.factor(dat$monocot1)
+
+dat$yi <- dat$yi - min(dat$yi)
+summary(dat$yi)
+
+write.csv(dat, "dat.rp.RYT.CompRelated.csv")
+```
+
+<br>
+**Calculate total sampling variance**
+```{r sampling variance}
+W <- diag(dat$vi^-1)
+ff <- yi ~ pair.dist + target.ratio - 1
+m <- model.frame(ff, dat)
+X <- model.matrix(ff, m)
+P <- W - W %*% X %*% solve(t(X) %*% W %*% X) %*% t(X) %*% W
+sigma2_d <- (nrow(dat) - ncol(X))/ sum(diag(P))
+print(sigma2_d)
+```
+<br>
+**Run Stan model**
+```{r Stan model, message = FALSE}
+source("phylo_sdep2_stan.R")
+source("compet_relatedness_stan.R") #run_stan
+
+
+stan.output <- meta.stan(data = dat, X = X, 
+                         VCV_nb = VCV.nb, VCV_tg = VCV.tg,
+                         sigma2_d = sigma2_d, mm_nb = mm.nb, 
+                         mm_tg = mm.tg, niter = 20000, warmup = 10000, 
+                         thin = 20, chains = 3)
+save(stan.output, file = "replacement.subs20.TargetRatio.RYT.Phylo.BOG.20000iter.RData")
+
+
+stan.output <- run_stan(data = dat, X = X,
+                         VCV_nb = VCV.nb, VCV_tg = VCV.tg,
+                         mm_nb = mm.nb, mm_tg = mm.tg,
+                         niter = 20000, warmup = 10000, 
+                         thin = 20, chains = 3)
+save(stan.output, file = "replacement.subs20.TargetRatio.RYT.CompRelat.20000iter.RData")
+
+hypothesis(stan.output, c("beta[1] = beta[2]", "beta[1] = beta[3]", 
+                 "beta[2] = beta[3]"),
+           alpha = 0.05, seed = 500)
+                                       
+# save(m2, file = "replacement.phylo2.sdep2.subs20.PairDifs.TargetRatio.Mean.RData")
+# 
+# save(m2, file = "m2.phylo2.mrem.sdep2.stan.additive.subs20.Monocots.PairDif.TargetRatio.PhyloDist.linear.run4.RData")
+
+print(stan.output, c( "beta", "sigma_study", "sigma_sdep", "sigma_nb", "sigma_tg", "sigma_nb_phylo", "sigma_tg_phylo", "sigma_obs"))
+print(stan.output, c( "a", "beta1", "beta2", "sigma_study", "sigma_nb", "sigma_tg", "sigma_nb_phylo", "sigma_tg_phylo", "sigma_obs"))
+
+table(dat$group1)
+```
+<br>
+**Cross-validation for Stan model**
+```{r cross valid}
+log_lik <- extract_log_lik(stan.output)
+loo1 <- loo(log_lik)
+loo1
+```
